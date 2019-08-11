@@ -1,0 +1,14 @@
+{
+  "SchemaVersion": 1,
+  "Name" : "spheremon",
+  "ComponentId" : "f54ee4c5-40a0-4f65-a7b7-acc9ad62bea6",
+  "EntryPoint": "/bin/app",
+  "CmdArgs": [],
+  "Capabilities": {
+    "AllowedConnections": [],
+    "Gpio": [ 9 ],
+    "Uart": [],
+    "WifiConfig": false
+  },
+  "ApplicationType":"Default"
+}
