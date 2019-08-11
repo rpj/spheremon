@@ -1,0 +1,3 @@
+[submodule "yarl"]
+	path = yarl
+	url = https://github.com/electric-sheep-co/yarl.git

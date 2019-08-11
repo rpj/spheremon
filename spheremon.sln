@@ -4,6 +4,11 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 VisualStudioVersion = 15.0.28307.757
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "spheremon", "spheremon\spheremon.vcxproj", "{749046E9-2679-4C14-9734-08EBC9EA4322}"
+	ProjectSection(ProjectDependencies) = postProject
+		{6E98C738-2F73-41B2-A0FE-79B0588FA810} = {6E98C738-2F73-41B2-A0FE-79B0588FA810}
+	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "yarl", "yarl\azuresphere\yarl.vcxproj", "{6E98C738-2F73-41B2-A0FE-79B0588FA810}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -15,6 +20,10 @@ Global
 		{749046E9-2679-4C14-9734-08EBC9EA4322}.Debug|ARM.Build.0 = Debug|ARM
 		{749046E9-2679-4C14-9734-08EBC9EA4322}.Release|ARM.ActiveCfg = Release|ARM
 		{749046E9-2679-4C14-9734-08EBC9EA4322}.Release|ARM.Build.0 = Release|ARM
+		{6E98C738-2F73-41B2-A0FE-79B0588FA810}.Debug|ARM.ActiveCfg = Debug|ARM
+		{6E98C738-2F73-41B2-A0FE-79B0588FA810}.Debug|ARM.Build.0 = Debug|ARM
+		{6E98C738-2F73-41B2-A0FE-79B0588FA810}.Release|ARM.ActiveCfg = Release|ARM
+		{6E98C738-2F73-41B2-A0FE-79B0588FA810}.Release|ARM.Build.0 = Release|ARM
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
