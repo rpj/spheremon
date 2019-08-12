@@ -11,8 +11,10 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <assert.h>
 
 #include <applibs/networking.h>
+#include <applibs/gpio.h>
 
 #include <yarl.h>
 
@@ -76,7 +78,7 @@ RedisConnection_t RedisConnect(const char *host, const char *port)
     return (RedisConnection_t)sockfd;
 }
 
-#define TEST_KEY_NAME "SphereMonSaysHi"
+#define WAIT_FOR_WIFI_SECONDS   120
 
 bool netCheck(void);
 
@@ -85,6 +87,53 @@ bool netCheck()
     bool netUp = false;
     return Networking_IsNetworkingReady(&netUp) != -1 && netUp;
 }
+
+int checkKeys(RedisConnection_t conn, RedisArray_t *keys)
+{
+    assert(keys && keys->count);
+    int lostCount = 0;
+    for (int i = 0; i < keys->count; i++)
+    {
+        char *checkKey = (char*)keys->objects[i].obj;
+        if (!Redis_EXISTS(conn, checkKey))
+        {
+            printf("Lost '%s'!\n", checkKey);
+            ++lostCount;
+        }
+    }
+    return lostCount;
+}
+
+#define RED_LED 8
+#define GREEN_LED 9
+#define BLUE_LED 10
+#define RED_FDIDX (RED_LED-RED_LED)
+#define GREEN_FDIDX (GREEN_LED-RED_LED)
+#define BLUE_FDIDX (BLUE_LED-RED_LED)
+#define LED_COUNT 3
+#define LED_ON GPIO_Value_Low
+#define LED_OFF GPIO_Value_High
+
+int* setupLEDs(void);
+int* setupLEDs()
+{
+    // keeps these in index order from above or else!
+    int leds[LED_COUNT] = { RED_LED, GREEN_LED, BLUE_LED };
+    int* fds = (int*)malloc(LED_COUNT * sizeof(int));
+
+    for (int i = 0; i < LED_COUNT; i++) {
+        fds[i] = GPIO_OpenAsOutput(leds[i], GPIO_OutputMode_PushPull, GPIO_Value_High);
+        if (fds[i] < 0) {
+            fprintf(stderr,
+                "Error opening GPIO %u: %s (%d). Check that app_manifest.json includes the GPIO used.\n",
+                leds[i], strerror(errno), errno);
+            return NULL;
+        }
+    }
+    return fds;
+}
+
+#define TOGGLE_ALL(fds, val) do { for (int i = 0; i < LED_COUNT; i++) GPIO_SetValue(fds[i], val); } while(0)
 
 int main(int argc, char** argv)
 {
@@ -98,11 +147,36 @@ int main(int argc, char** argv)
     const char* port = argv[2];
     const char* pass = argc > 3 ? argv[3] : NULL;
 
-    if (!netCheck())
+    int* fds = setupLEDs();
+
+    if (!fds)
     {
-        perror("Networking Is Not Ready");
+        fprintf(stderr, "LED setup failed\n\n");
+        exit(-1);
+    }
+
+    GPIO_SetValue(fds[BLUE_FDIDX], LED_ON);
+
+    const struct timespec sleepTime = { 1, 0 };
+    static int netCheckRetries = WAIT_FOR_WIFI_SECONDS;
+    while (!netCheck() && --netCheckRetries)
+    {
+        const struct timespec quickTime = { 0, 5e7 };
+        GPIO_SetValue(fds[RED_FDIDX], LED_ON);
+        nanosleep(&quickTime, NULL);
+        GPIO_SetValue(fds[RED_FDIDX], LED_OFF);
+        nanosleep(&sleepTime, NULL);
+    }
+
+    GPIO_SetValue(fds[BLUE_FDIDX], LED_OFF);
+
+    if (!netCheckRetries)
+    {
+        perror("Networking init failed");
         exit(-errno);
     }
+
+    GPIO_SetValue(fds[GREEN_FDIDX], LED_ON);
 
     RedisConnection_t rConn = RedisConnect(host, port);
 
@@ -118,35 +192,60 @@ int main(int argc, char** argv)
         exit(-1);
     }
 
-    bool exists = Redis_EXISTS(rConn, TEST_KEY_NAME);
-    printf("Exists already? %d\n", exists);
+    RedisArray_t *rpjiosKeys = Redis_KEYS(rConn, "rpjios.checkin.*");
+    RedisArray_t *zerowatchKeys = Redis_KEYS(rConn, "*:heartbeat");
 
-    if (exists && !Redis_DEL(rConn, TEST_KEY_NAME))
+    if (!rpjiosKeys || !zerowatchKeys)
     {
-        fprintf(stderr, "DEL failed\n");
+        fprintf(stderr, "Failed to query key sets we expected\n");
         exit(-2);
     }
 
-    if (!Redis_SET(rConn, TEST_KEY_NAME, "Hello, World!"))
+    const struct timespec loopTime = { 10, 0 };
+    const struct timespec blinkTime = { 1, 0 };
+
+    printf("Found %d rpjios and %d zerowatch keys to monitor every %ds...\n",
+        rpjiosKeys->count, zerowatchKeys->count, loopTime.tv_sec);
+
+    nanosleep(&blinkTime, NULL);
+    GPIO_SetValue(fds[GREEN_FDIDX], LED_OFF);
+    int lastLost = 0;
+
+    while (1)
     {
-        fprintf(stderr, "SET failed\n");
-        exit(-2);
+        printf("Running key check...\n");
+        if (!lastLost)
+        {
+            const struct timespec quickTime = { 0, 3e7 };
+            for (int i = 0; i < LED_COUNT; i++)
+            {
+                GPIO_SetValue(fds[i], LED_ON);
+                nanosleep(&quickTime, NULL);
+                GPIO_SetValue(fds[i], LED_OFF);
+                nanosleep(&quickTime, NULL);
+            }
+        }
+
+        lastLost = checkKeys(rConn, rpjiosKeys) + checkKeys(rConn, zerowatchKeys);
+        if (lastLost)
+        {
+            printf("Lost %d keys!\n", lastLost);
+            GPIO_SetValue(fds[RED_FDIDX], LED_ON);
+            for (int i = 0; i < lastLost; i++)
+            {
+                GPIO_SetValue(fds[BLUE_FDIDX], LED_ON);
+                nanosleep(&blinkTime, NULL);
+                GPIO_SetValue(fds[BLUE_FDIDX], LED_OFF);
+                nanosleep(&blinkTime, NULL);
+            }
+        }
+        else
+        {
+            TOGGLE_ALL(fds, LED_OFF);
+        }
+
+        fflush(stdout);
+        fflush(stderr);
+        nanosleep(&loopTime, NULL);
     }
-
-    char* getVal = Redis_GET(rConn, TEST_KEY_NAME);
-    printf("Hello, World? %s\n", getVal);
-    free(getVal);
-
-    int appended = Redis_APPEND(rConn, TEST_KEY_NAME, " It's a beautiful day!");
-    getVal = Redis_GET(rConn, TEST_KEY_NAME);
-    printf("Appended %d bytes, now have '%s'\n", appended, getVal);
-    free(getVal);
-
-    if (!Redis_DEL(rConn, TEST_KEY_NAME))
-    {
-        fprintf(stderr, "DEL failed\n");
-        exit(-2);
-    }
-
-    printf("Publish result: %d\n", Redis_PUBLISH(rConn, TEST_KEY_NAME, "Pub/sub is the bee's knees!"));
 }

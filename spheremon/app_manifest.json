@@ -6,7 +6,7 @@
   "CmdArgs": [ "192.168.1.252", "6379", "" ],
   "Capabilities": {
     "AllowedConnections": [ "192.168.1.252" ],
-    "Gpio": [],
+    "Gpio": [ 8, 9, 10 ],
     "Uart": [],
     "WifiConfig": false
   },
