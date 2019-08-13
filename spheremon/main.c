@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <netdb.h>
 #include <sys/types.h>
@@ -12,6 +13,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <pthread.h>
 
 #include <applibs/networking.h>
 #include <applibs/gpio.h>
@@ -95,11 +97,7 @@ int checkKeys(RedisConnection_t conn, RedisArray_t *keys)
     for (int i = 0; i < keys->count; i++)
     {
         char *checkKey = (char*)keys->objects[i].obj;
-        if (!Redis_EXISTS(conn, checkKey))
-        {
-            printf("Lost '%s'!\n", checkKey);
-            ++lostCount;
-        }
+        lostCount += !Redis_EXISTS(conn, checkKey);
     }
     return lostCount;
 }
@@ -113,6 +111,13 @@ int checkKeys(RedisConnection_t conn, RedisArray_t *keys)
 #define LED_COUNT 3
 #define LED_ON GPIO_Value_Low
 #define LED_OFF GPIO_Value_High
+
+#define LOST_LED RED_FDIDX
+#define ACTIVITY_LED GREEN_FDIDX
+#define LOST_PULSE_LED BLUE_FDIDX
+
+#define KEY_CHECK_CADENCE_SECONDS 5
+#define MSG_CADENCE_AMOUNT 10
 
 int* setupLEDs(void);
 int* setupLEDs()
@@ -130,10 +135,166 @@ int* setupLEDs()
             return NULL;
         }
     }
+    printf("LEDs initialized: activity=%d lost=%d lost-count=%d\n", 
+        ACTIVITY_LED+RED_LED, LOST_LED+RED_LED, LOST_PULSE_LED+RED_LED);
     return fds;
 }
 
 #define TOGGLE_ALL(fds, val) do { for (int i = 0; i < LED_COUNT; i++) GPIO_SetValue(fds[i], val); } while(0)
+
+typedef struct psubThreadArgs
+{
+    int* fds;
+    const char* host;
+    const char* port;
+    const char* pass;
+} psubThreadArgs_t;
+
+int msgCount = 0;
+int __attribute__((atomic)) threadRunningCount = 0;
+bool __attribute__((atomic)) running = true;
+
+RedisConnection_t newConnection(psubThreadArgs_t* tArgs)
+{
+    assert(tArgs);
+    RedisConnection_t threadConn = RedisConnect(tArgs->host, tArgs->port);
+
+    if (threadConn < 1)
+    {
+        fprintf(stderr, "psubThread: RedisConnect failed: %d\n", threadConn);
+        exit(-1);
+    }
+
+    if (tArgs->pass && !Redis_AUTH(threadConn, tArgs->pass))
+    {
+        fprintf(stderr, "psubThread: AUTH failed\n");
+        exit(-1);
+    }
+
+    return threadConn;
+}
+
+void* psubThreadFunc(void* arg)
+{
+    assert(arg);
+    psubThreadArgs_t* tArgs = (psubThreadArgs_t*)arg;
+    RedisConnection_t threadConn = newConnection(tArgs);
+
+    if (threadConn < 1)
+    {
+        fprintf(stderr, "psubThread: RedisConnect failed: %d\n", threadConn);
+        exit(-1);
+    }
+
+    if (tArgs->pass && !Redis_AUTH(threadConn, tArgs->pass))
+    {
+        fprintf(stderr, "psubThread: AUTH failed\n");
+        exit(-1);
+    }
+
+    Redis_PSUBSCRIBE(threadConn, "*");
+    printf("activity thread up and running.\n");
+    threadRunningCount++;
+
+    while (running)
+    {
+        RedisObject_t nextObj = RedisConnection_getNextObject(threadConn);
+        RedisObject_dealloc(nextObj);
+
+        struct timespec quickTime = { 0, 5e4 };
+        bool msgCadenceHit = msgCount && !(msgCount % MSG_CADENCE_AMOUNT);
+
+        if (msgCadenceHit) GPIO_SetValue(tArgs->fds[ACTIVITY_LED], LED_ON);
+        GPIO_SetValue(tArgs->fds[LOST_PULSE_LED], LED_ON);
+
+        nanosleep(&quickTime, NULL);
+
+        if (msgCadenceHit) GPIO_SetValue(tArgs->fds[ACTIVITY_LED], LED_OFF);
+        GPIO_SetValue(tArgs->fds[LOST_PULSE_LED], LED_OFF);
+
+        ++msgCount;
+    }
+
+    printf("activity thread exiting.\n");
+    --threadRunningCount;
+}
+
+void* cmdThreadFunc(void* arg)
+{
+    assert(arg);
+    psubThreadArgs_t* tArgs = (psubThreadArgs_t*)arg;
+    RedisConnection_t threadConn = newConnection(tArgs);
+
+    if (threadConn < 1)
+    {
+        fprintf(stderr, "cmdThreadFunc: RedisConnect failed: %d\n", threadConn);
+        exit(-1);
+    }
+
+    if (tArgs->pass && !Redis_AUTH(threadConn, tArgs->pass))
+    {
+        fprintf(stderr, "cmdThreadFunc: AUTH failed\n");
+        exit(-1);
+    }
+
+    Redis_SUBSCRIBE(threadConn, "spheremon:command");
+    printf("command thread up and running.\n");
+    threadRunningCount++;
+
+    while (running)
+    {
+        RedisObject_t nextObj = RedisConnection_getNextObject(threadConn);
+
+        if (nextObj.type == RedisObjectType_Array && nextObj.obj)
+        {
+            RedisArray_t* arr = (RedisArray_t*)nextObj.obj;
+            if (arr->count == 3 && arr->objects[2].type == RedisObjectType_BulkString && arr->objects[2].obj)
+            {
+                char sBuf[64];
+                bzero(sBuf, 64);
+                char* cmdStr = (char*)arr->objects[2].obj;
+                bool sBufHasResp = true;
+
+                if (!strncmp("message-count", cmdStr, strlen("message-count")))
+                    snprintf(sBuf, 64, "%d", msgCount);
+                else if (!strncmp("killkillkill", cmdStr, strlen("killkillkill")))
+                {
+                    printf("Kill command! Shutting down...\n");
+                    fflush(stdout);
+                    running = false;
+                    sBufHasResp = false;
+                }
+                else
+                    sBufHasResp = false;
+
+                if (sBufHasResp)
+                {
+                    int chanNameLen = strlen("spheremon:command:result:") + strlen(cmdStr) + 1;
+                    char* chanName = (char*)malloc(chanNameLen);
+                    bzero(chanName, chanNameLen);
+                    snprintf(chanName, chanNameLen, "spheremon:command:result:%s", cmdStr);
+
+                    // can't use threadConn because it's in the "subscribe" modality
+                    RedisConnection_t tempConn = newConnection(tArgs);
+                    if (!Redis_SET(tempConn, chanName, sBuf))
+                        fprintf(stderr, "failed to set %s\n", chanName);
+                    Redis_PUBLISH(tempConn, chanName, sBuf);
+
+                    close(tempConn);
+                    free(chanName);
+
+                    printf("Command '%s' respone: '%s'\n", cmdStr, sBuf);
+                    fflush(stdout);
+                }
+            }
+        }
+
+        RedisObject_dealloc(nextObj);
+    }
+
+    printf("command thread exiting.\n");
+    --threadRunningCount;
+}
 
 int main(int argc, char** argv)
 {
@@ -147,6 +308,7 @@ int main(int argc, char** argv)
     const char* port = argv[2];
     const char* pass = argc > 3 ? argv[3] : NULL;
 
+    printf("Running GPIO setup for LEDs...\n");
     int* fds = setupLEDs();
 
     if (!fds)
@@ -155,6 +317,9 @@ int main(int argc, char** argv)
         exit(-1);
     }
 
+    TOGGLE_ALL(fds, LED_OFF);
+
+    printf("Verifying network availability...\n");
     GPIO_SetValue(fds[BLUE_FDIDX], LED_ON);
 
     const struct timespec sleepTime = { 1, 0 };
@@ -176,22 +341,24 @@ int main(int argc, char** argv)
         exit(-errno);
     }
 
+    if (netCheckRetries != WAIT_FOR_WIFI_SECONDS)
+    {
+        printf("... waited %d seconds for network.\n", WAIT_FOR_WIFI_SECONDS - netCheckRetries);
+    }
+
+    printf("Connecting to redis://%s%s:%s...\n", pass ? "*@" : "", host, port);
     GPIO_SetValue(fds[GREEN_FDIDX], LED_ON);
 
-    RedisConnection_t rConn = RedisConnect(host, port);
+    psubThreadArgs_t psubThreadArgs = {
+        .fds = fds,
+        .host = host,
+        .port = port,
+        .pass = pass
+    };
 
-    if (rConn < 1)
-    {
-        fprintf(stderr, "RedisConnect failed: %d\n", rConn);
-        exit(rConn);
-    }
+    RedisConnection_t rConn = newConnection(&psubThreadArgs);
 
-    if (pass && !Redis_AUTH(rConn, pass))
-    {
-        fprintf(stderr, "AUTH failed\n");
-        exit(-1);
-    }
-
+    printf("Querying expected key sets...\n");
     RedisArray_t *rpjiosKeys = Redis_KEYS(rConn, "rpjios.checkin.*");
     RedisArray_t *zerowatchKeys = Redis_KEYS(rConn, "*:heartbeat");
 
@@ -201,41 +368,59 @@ int main(int argc, char** argv)
         exit(-2);
     }
 
-    const struct timespec loopTime = { 10, 0 };
-    const struct timespec blinkTime = { 1, 0 };
+    const struct timespec loopTime = { KEY_CHECK_CADENCE_SECONDS, 0 };
+    const struct timespec blinkTime = { 0, 5e8 };
 
-    printf("Found %d rpjios and %d zerowatch keys to monitor every %ds...\n",
+    printf("Found %d rpjios and %d zerowatch keys to monitor every %ds\n",
         rpjiosKeys->count, zerowatchKeys->count, loopTime.tv_sec);
 
+    pthread_t psubThread;
+    pthread_t commandThread;
+
+    printf("Starting activity thread...\n");
+    int pc = pthread_create(&psubThread, NULL, psubThreadFunc, &psubThreadArgs);
+
+    if (pc)
+    {
+        fprintf(stderr, "pthread_create (activity): %d\n", pc);
+        exit(pc);
+    }
+
+    printf("Starting command thread...\n");
+    pc = pthread_create(&commandThread, NULL, cmdThreadFunc, &psubThreadArgs);
+
+    if (pc)
+    {
+        fprintf(stderr, "pthread_create (command): %d\n", pc);
+        exit(pc);
+    }
+
+    GPIO_SetValue(fds[BLUE_FDIDX], LED_OFF);
+    while (threadRunningCount < 2);
+
     nanosleep(&blinkTime, NULL);
-    GPIO_SetValue(fds[GREEN_FDIDX], LED_OFF);
+    TOGGLE_ALL(fds, LED_OFF);
     int lastLost = 0;
 
-    while (1)
-    {
-        printf("Running key check...\n");
-        if (!lastLost)
-        {
-            const struct timespec quickTime = { 0, 3e7 };
-            for (int i = 0; i < LED_COUNT; i++)
-            {
-                GPIO_SetValue(fds[i], LED_ON);
-                nanosleep(&quickTime, NULL);
-                GPIO_SetValue(fds[i], LED_OFF);
-                nanosleep(&quickTime, NULL);
-            }
-        }
+    printf("spheremon fully initialized.\n");
+    fflush(stdout);
 
+    // printing to serial automatically lights the orange "App" LED, which from
+    // here on out we'll use instead to mark every command-response messages, 
+    // via the print statements emitted to serial from psubThreadFunc. nothing else should
+    // print to serial, so as to allow that LED to function  command-response indicator
+
+    while (running)
+    {
         lastLost = checkKeys(rConn, rpjiosKeys) + checkKeys(rConn, zerowatchKeys);
         if (lastLost)
         {
-            printf("Lost %d keys!\n", lastLost);
-            GPIO_SetValue(fds[RED_FDIDX], LED_ON);
+            GPIO_SetValue(fds[LOST_LED], LED_ON);
             for (int i = 0; i < lastLost; i++)
             {
-                GPIO_SetValue(fds[BLUE_FDIDX], LED_ON);
+                GPIO_SetValue(fds[LOST_PULSE_LED], LED_ON);
                 nanosleep(&blinkTime, NULL);
-                GPIO_SetValue(fds[BLUE_FDIDX], LED_OFF);
+                GPIO_SetValue(fds[LOST_PULSE_LED], LED_OFF);
                 nanosleep(&blinkTime, NULL);
             }
         }
@@ -248,4 +433,10 @@ int main(int argc, char** argv)
         fflush(stderr);
         nanosleep(&loopTime, NULL);
     }
+
+    printf("spheremon exiting (%d children left)...\n", threadRunningCount);
+    pthread_join(psubThread, NULL);
+    pthread_join(commandThread, NULL);
+    printf("spheremon done.\n");
+    fflush(stdout);
 }
