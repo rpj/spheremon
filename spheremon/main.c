@@ -150,7 +150,9 @@ typedef struct psubThreadArgs
     const char* pass;
 } psubThreadArgs_t;
 
-int msgCount = 0;
+int trackedKeyCount = 0;
+int __attribute__((atomic)) msgCount = 0;
+int __attribute__((atomic)) lastLost = 0;
 int __attribute__((atomic)) threadRunningCount = 0;
 bool __attribute__((atomic)) running = true;
 
@@ -162,13 +164,15 @@ RedisConnection_t newConnection(psubThreadArgs_t* tArgs)
     if (threadConn < 1)
     {
         fprintf(stderr, "RedisConnect failed: %d\n", threadConn);
-        exit(-1);
+        fflush(stderr);
+        exit(42);
     }
 
     if (tArgs->pass && !Redis_AUTH(threadConn, tArgs->pass))
     {
         fprintf(stderr, "AUTH failed\n");
-        exit(-1);
+        fflush(stderr);
+        exit(43);
     }
 
     return threadConn;
@@ -189,16 +193,19 @@ void* psubThreadFunc(void* arg)
         RedisObject_t nextObj = RedisConnection_getNextObject(threadConn);
         RedisObject_dealloc(nextObj);
 
-        struct timespec quickTime = { 0, 5e4 };
-        bool msgCadenceHit = msgCount && !(msgCount % MSG_CADENCE_AMOUNT);
+        if (!lastLost)
+        {
+            struct timespec quickTime = { 0, 5e4 };
+            bool msgCadenceHit = msgCount && !(msgCount % MSG_CADENCE_AMOUNT);
 
-        if (msgCadenceHit) GPIO_SetValue(tArgs->fds[ACTIVITY_LED], LED_ON);
-        GPIO_SetValue(tArgs->fds[LOST_PULSE_LED], LED_ON);
+            if (msgCadenceHit) GPIO_SetValue(tArgs->fds[ACTIVITY_LED], LED_ON);
+            GPIO_SetValue(tArgs->fds[LOST_PULSE_LED], LED_ON);
 
-        nanosleep(&quickTime, NULL);
+            nanosleep(&quickTime, NULL);
 
-        if (msgCadenceHit) GPIO_SetValue(tArgs->fds[ACTIVITY_LED], LED_OFF);
-        GPIO_SetValue(tArgs->fds[LOST_PULSE_LED], LED_OFF);
+            if (msgCadenceHit) GPIO_SetValue(tArgs->fds[ACTIVITY_LED], LED_OFF);
+            GPIO_SetValue(tArgs->fds[LOST_PULSE_LED], LED_OFF);
+        }
 
         ++msgCount;
     }
@@ -233,6 +240,8 @@ void* cmdThreadFunc(void* arg)
 
                 if (!strncmp("message-count", cmdStr, strlen("message-count")))
                     snprintf(sBuf, 64, "%d", msgCount);
+                else if (!strncmp("tracked-keys", cmdStr, strlen("tracked-keys")))
+                    snprintf(sBuf, 64, "%d/%d", trackedKeyCount - lastLost, trackedKeyCount);
                 else if (!strncmp("killkillkill", cmdStr, strlen("killkillkill")))
                 {
                     printf("Kill command! Shutting down...\n");
@@ -349,6 +358,7 @@ int main(int argc, char** argv)
 
     printf("Found %d rpjios and %d zerowatch keys to monitor every %ds\n",
         rpjiosKeys->count, zerowatchKeys->count, loopTime.tv_sec);
+    trackedKeyCount = rpjiosKeys->count + zerowatchKeys->count;
 
     pthread_t psubThread;
     pthread_t commandThread;
@@ -376,7 +386,6 @@ int main(int argc, char** argv)
 
     nanosleep(&blinkTime, NULL);
     TOGGLE_ALL(fds, LED_OFF);
-    int lastLost = 0;
 
     printf("spheremon fully initialized.\n");
     fflush(stdout);
@@ -413,6 +422,6 @@ int main(int argc, char** argv)
     printf("spheremon exiting (%d children left)...\n", threadRunningCount);
     pthread_join(psubThread, NULL);
     pthread_join(commandThread, NULL);
-    printf("spheremon done.\n");
+    printf("spheremon done, tracked %d total messages.\n", msgCount);
     fflush(stdout);
 }
