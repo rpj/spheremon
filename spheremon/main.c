@@ -161,13 +161,13 @@ RedisConnection_t newConnection(psubThreadArgs_t* tArgs)
 
     if (threadConn < 1)
     {
-        fprintf(stderr, "psubThread: RedisConnect failed: %d\n", threadConn);
+        fprintf(stderr, "RedisConnect failed: %d\n", threadConn);
         exit(-1);
     }
 
     if (tArgs->pass && !Redis_AUTH(threadConn, tArgs->pass))
     {
-        fprintf(stderr, "psubThread: AUTH failed\n");
+        fprintf(stderr, "AUTH failed\n");
         exit(-1);
     }
 
@@ -179,18 +179,6 @@ void* psubThreadFunc(void* arg)
     assert(arg);
     psubThreadArgs_t* tArgs = (psubThreadArgs_t*)arg;
     RedisConnection_t threadConn = newConnection(tArgs);
-
-    if (threadConn < 1)
-    {
-        fprintf(stderr, "psubThread: RedisConnect failed: %d\n", threadConn);
-        exit(-1);
-    }
-
-    if (tArgs->pass && !Redis_AUTH(threadConn, tArgs->pass))
-    {
-        fprintf(stderr, "psubThread: AUTH failed\n");
-        exit(-1);
-    }
 
     Redis_PSUBSCRIBE(threadConn, "*");
     printf("activity thread up and running.\n");
@@ -224,18 +212,6 @@ void* cmdThreadFunc(void* arg)
     assert(arg);
     psubThreadArgs_t* tArgs = (psubThreadArgs_t*)arg;
     RedisConnection_t threadConn = newConnection(tArgs);
-
-    if (threadConn < 1)
-    {
-        fprintf(stderr, "cmdThreadFunc: RedisConnect failed: %d\n", threadConn);
-        exit(-1);
-    }
-
-    if (tArgs->pass && !Redis_AUTH(threadConn, tArgs->pass))
-    {
-        fprintf(stderr, "cmdThreadFunc: AUTH failed\n");
-        exit(-1);
-    }
 
     Redis_SUBSCRIBE(threadConn, "spheremon:command");
     printf("command thread up and running.\n");
